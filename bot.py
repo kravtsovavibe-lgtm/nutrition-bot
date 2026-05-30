@@ -228,7 +228,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         file = await context.bot.get_file(photo.file_id)
-        file_bytes = await file.download_as_bytearray()
+       import io
+buf = io.BytesIO()
+await file.download_to_memory(buf)
+file_bytes = buf.getvalue()
         image_data = base64.b64encode(file_bytes).decode("utf-8")
     except Exception as e:
         await update.message.reply_text("Не могу загрузить фото, попробуй ещё раз.")
