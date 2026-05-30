@@ -5,8 +5,10 @@ import sqlite3
 import logging
 import base64
 from datetime import datetime, date
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+import asyncio
 import anthropic
 
 logging.basicConfig(level=logging.INFO)
@@ -23,29 +25,20 @@ USER_PROFILE = {
     "age": 35,
     "calories_target": 1420,
     "protein_target": 110,
-    "no_eat": ["варёные овощи", "лук"],
 }
 
 SYSTEM_PROMPT = """Ты личный нутрициолог для Кравцовой Анастасии.
 Параметры: рост 162см, возраст 35 лет, стартовый вес 78.4кг, жир 39.6%.
 Цель: минус 10кг за 2 месяца. Норма: 1420 ккал, белок 110г, вода 2.5л.
 Не ест: варёные овощи, лук.
-Тренировки: зарядка, тазовое дно (Сабина Филина), резинка, пилатес (Александра Кибзий), устранение живота (Сергей Оларь).
-
-Задачи:
-1. Анализировать фото еды — калории, белок, что записать
-2. Читать фото с весов Picooc — вес, жир, мышцы, вода
-3. Анализировать состав продуктов — подходит/нет
-4. Рецепты из содержимого холодильника
-5. Корректировать питание — говорить если мало белка, много калорий
-6. Анализировать фото тела — описывать изменения
-
+Задачи: анализировать фото еды, читать весы Picooc, проверять состав продуктов, предлагать рецепты из холодильника, корректировать питание, анализировать фото тела.
 Стиль: дружелюбно, кратко, по делу. Всегда на русском."""
+
+DB_PATH = "/tmp/nutrition.db"
 
 
 def init_db():
-    db_path = "/tmp/nutrition.db"
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS weight_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,7 +53,7 @@ def init_db():
 
 
 def get_db():
-    return sqlite3.connect("/tmp/nutrition.db")
+    return sqlite3.connect(DB_PATH)
 
 
 def get_today_stats():
@@ -118,12 +111,12 @@ def save_food(description, calories, protein):
         logger.error(f"save_food: {e}")
 
 
-def ask_claude(prompt, image_data=None, image_type="image/jpeg"):
+def ask_claude(prompt, image_data=None):
     content = []
     if image_data:
         content.append({
             "type": "image",
-            "source": {"type": "base64", "media_type": image_type, "data": image_data}
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data}
         })
     content.append({"type": "text", "text": prompt})
     response = claude.messages.create(
@@ -136,16 +129,21 @@ def ask_claude(prompt, image_data=None, image_type="image/jpeg"):
 
 
 def main_keyboard():
-    keyboard = [
-        [KeyboardButton("📊 Статистика"), KeyboardButton("📸 Фото весов")],
-        [KeyboardButton("🍽 Записать еду"), KeyboardButton("🛒 Список покупок")],
-        [KeyboardButton("📅 Отчёт за неделю"), KeyboardButton("💪 Тренировки")],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📸 Фото весов")],
+        [KeyboardButton(text="🍽 Записать еду"), KeyboardButton(text="🛒 Список покупок")],
+        [KeyboardButton(text="📅 Отчёт за неделю"), KeyboardButton(text="💪 Тренировки")],
+    ], resize_keyboard=True)
+    return keyboard
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    await message.answer(
         "Привет! Я твой личный нутрициолог 🌿\n\n"
         "Что умею:\n"
         "📸 Читать фото с весов Picooc\n"
@@ -158,88 +156,65 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+@dp.message(F.text == "📊 Статистика")
+async def stats(message: types.Message):
     today = get_today_stats()
     last_w = get_last_weight()
-
-    if text == "📊 Статистика":
-        cal_left = USER_PROFILE["calories_target"] - today["calories"]
-        prot_left = USER_PROFILE["protein_target"] - today["protein"]
-        msg = f"📊 {date.today().strftime('%d.%m')}\n\n"
-        msg += f"🔥 {today['calories']} / {USER_PROFILE['calories_target']} ккал (осталось {max(0, cal_left)})\n"
-        msg += f"💪 {today['protein']:.0f} / {USER_PROFILE['protein_target']}г белка"
-        if prot_left > 0:
-            msg += f" (ещё {prot_left:.0f}г)"
-        if today["meals"]:
-            msg += "\n\n🍽 " + "\n• ".join([""] + today["meals"])
-        if last_w:
-            diff = last_w["weight"] - USER_PROFILE["weight_start"]
-            sign = "−" if diff < 0 else "+"
-            msg += f"\n\n⚖️ Вес: {last_w['weight']} кг ({sign}{abs(diff):.1f} от старта)\n"
-            msg += f"Жир: {last_w['fat']}% | Мышцы: {last_w['muscle']}%"
-        await update.message.reply_text(msg)
-        return
-
-    if text == "📅 Отчёт за неделю":
-        try:
-            conn = get_db()
-            c = conn.cursor()
-            c.execute("SELECT date, weight, fat FROM weight_log ORDER BY created_at DESC LIMIT 7")
-            weights = c.fetchall()
-            conn.close()
-            msg = "📅 Динамика за неделю\n\n"
-            if weights:
-                for w in weights:
-                    msg += f"• {w[0]}: {w[1]} кг, жир {w[2]}%\n"
-            else:
-                msg += "Замеров пока нет. Скинь фото с весов!"
-            await update.message.reply_text(msg)
-        except Exception:
-            await update.message.reply_text("Не могу загрузить данные.")
-        return
-
-    if text == "💪 Тренировки":
-        msg = "💪 План на сегодня:\n\n• Зарядка — 10 мин\n• Тазовое дно (Сабина Филина)\n• Тренировка с резинкой — 25 мин\n• Диафрагмальное дыхание — 5 мин"
-        await update.message.reply_text(msg)
-        return
-
-    ctx = f"\nСегодня {date.today().strftime('%d.%m')}. Съедено: {today['calories']} ккал, белок {today['protein']:.0f}г. Осталось: {USER_PROFILE['calories_target']-today['calories']} ккал."
+    cal_left = USER_PROFILE["calories_target"] - today["calories"]
+    prot_left = USER_PROFILE["protein_target"] - today["protein"]
+    msg = f"📊 {date.today().strftime('%d.%m')}\n\n"
+    msg += f"🔥 {today['calories']} / {USER_PROFILE['calories_target']} ккал (осталось {max(0, cal_left)})\n"
+    msg += f"💪 {today['protein']:.0f} / {USER_PROFILE['protein_target']}г белка"
+    if prot_left > 0:
+        msg += f" (ещё {prot_left:.0f}г)"
+    if today["meals"]:
+        msg += "\n\n🍽 " + "\n• ".join([""] + today["meals"])
     if last_w:
-        ctx += f" Последний вес: {last_w['weight']} кг."
+        diff = last_w["weight"] - USER_PROFILE["weight_start"]
+        sign = "−" if diff < 0 else "+"
+        msg += f"\n\n⚖️ Вес: {last_w['weight']} кг ({sign}{abs(diff):.1f} от старта)\n"
+        msg += f"Жир: {last_w['fat']}% | Мышцы: {last_w['muscle']}%"
+    await message.answer(msg)
 
+
+@dp.message(F.text == "📅 Отчёт за неделю")
+async def weekly(message: types.Message):
     try:
-        reply = ask_claude(ctx + f"\nСообщение: {text}")
-
-        food_words = ["съела", "поела", "завтрак", "обед", "ужин", "перекус", "выпила", "ем", "пью", "скушала"]
-        if any(w in text.lower() for w in food_words):
-            try:
-                parse_text = ask_claude(f"Из текста '{text}' определи калории и белок. Ответь ТОЛЬКО JSON без markdown: {{\"calories\": число, \"protein\": число, \"description\": \"название\"}}")
-                parse_text = parse_text.strip().replace("```json", "").replace("```", "").strip()
-                data = json.loads(parse_text)
-                if data.get("calories", 0) > 0:
-                    save_food(data.get("description", text), data.get("calories", 0), data.get("protein", 0))
-            except Exception:
-                pass
-
-        await update.message.reply_text(reply)
-    except Exception as e:
-        await update.message.reply_text("Что-то пошло не так, попробуй ещё раз.")
-        logger.error(f"Text error: {e}")
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT date, weight, fat FROM weight_log ORDER BY created_at DESC LIMIT 7")
+        weights = c.fetchall()
+        conn.close()
+        msg = "📅 Динамика за неделю\n\n"
+        if weights:
+            for w in weights:
+                msg += f"• {w[0]}: {w[1]} кг, жир {w[2]}%\n"
+        else:
+            msg += "Замеров пока нет. Скинь фото с весов!"
+        await message.answer(msg)
+    except Exception:
+        await message.answer("Не могу загрузить данные.")
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    caption = update.message.caption or ""
+@dp.message(F.text == "💪 Тренировки")
+async def workouts(message: types.Message):
+    msg = "💪 План на сегодня:\n\n• Зарядка — 10 мин\n• Тазовое дно (Сабина Филина)\n• Тренировка с резинкой — 25 мин\n• Диафрагмальное дыхание — 5 мин"
+    await message.answer(msg)
+
+
+@dp.message(F.photo)
+async def handle_photo(message: types.Message):
+    caption = message.caption or ""
     today = get_today_stats()
 
     try:
-        photo = update.message.photo[-1]
-        tg_file = await context.bot.get_file(photo.file_id)
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
         buf = io.BytesIO()
-        await tg_file.download_to_memory(buf)
+        await bot.download_file(file.file_path, buf)
         image_data = base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception as e:
-        await update.message.reply_text("Не могу загрузить фото, попробуй ещё раз.")
+        await message.answer("Не могу загрузить фото, попробуй ещё раз.")
         logger.error(f"Download error: {e}")
         return
 
@@ -248,9 +223,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_scale = any(w in caption.lower() for w in scale_words) or not caption
 
     if is_scale:
-        prompt = ctx + "\nНа фото весы Picooc или напольные весы. Прочитай все показатели: вес кг, % жира, % мышц, % воды, СООВ. Запиши и дай короткий комментарий. Если не весы — скажи что на фото."
+        prompt = ctx + "\nНа фото весы Picooc. Прочитай показатели: вес кг, % жира, % мышц, % воды. Дай комментарий. Если не весы — проанализируй как еду."
     else:
-        prompt = ctx + f"\nФото с подписью: '{caption}'. Если еда — калории и белок, сколько осталось. Если состав продукта — подходит/нет. Если тело — опиши изменения. Если холодильник — предложи рецепт из того что видишь."
+        prompt = ctx + f"\nФото с подписью: '{caption}'. Если еда — калории и белок. Если состав — подходит/нет. Если тело — опиши изменения. Если холодильник — предложи рецепт."
 
     try:
         reply = ask_claude(prompt, image_data=image_data)
@@ -266,7 +241,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         else:
             try:
-                parse_text = ask_claude(f"Из текста '{reply}' извлеки калории еды. ТОЛЬКО JSON: {{\"calories\": число, \"protein\": число, \"description\": \"название\"}}")
+                parse_text = ask_claude(f"Из текста '{reply}' извлеки калории. ТОЛЬКО JSON: {{\"calories\": число, \"protein\": число, \"description\": \"название\"}}")
                 parse_text = parse_text.strip().replace("```json", "").replace("```", "").strip()
                 data = json.loads(parse_text)
                 if data.get("calories", 0) > 0:
@@ -274,26 +249,47 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        await update.message.reply_text(reply)
+        await message.answer(reply)
     except Exception as e:
-        await update.message.reply_text("Не могу обработать фото, попробуй ещё раз.")
+        await message.answer("Не могу обработать фото, попробуй ещё раз.")
         logger.error(f"Photo error: {e}")
 
 
-async def post_init(application: Application):
+@dp.message(F.text)
+async def handle_text(message: types.Message):
+    text = message.text
+    today = get_today_stats()
+    last_w = get_last_weight()
+
+    ctx = f"\nСегодня {date.today().strftime('%d.%m')}. Съедено: {today['calories']} ккал, белок {today['protein']:.0f}г. Осталось: {USER_PROFILE['calories_target']-today['calories']} ккал."
+    if last_w:
+        ctx += f" Последний вес: {last_w['weight']} кг."
+
+    try:
+        reply = ask_claude(ctx + f"\nСообщение: {text}")
+
+        food_words = ["съела", "поела", "завтрак", "обед", "ужин", "перекус", "выпила", "ем", "пью", "скушала"]
+        if any(w in text.lower() for w in food_words):
+            try:
+                parse_text = ask_claude(f"Из текста '{text}' определи калории. ТОЛЬКО JSON: {{\"calories\": число, \"protein\": число, \"description\": \"название\"}}")
+                parse_text = parse_text.strip().replace("```json", "").replace("```", "").strip()
+                data = json.loads(parse_text)
+                if data.get("calories", 0) > 0:
+                    save_food(data.get("description", text), data.get("calories", 0), data.get("protein", 0))
+            except Exception:
+                pass
+
+        await message.answer(reply)
+    except Exception as e:
+        await message.answer("Что-то пошло не так, попробуй ещё раз.")
+        logger.error(f"Text error: {e}")
+
+
+async def main():
     init_db()
-    logger.info("DB ready")
-
-
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-app.post_init = post_init
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("Bot started!")
-    app.run_polling(drop_pending_updates=True)
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
