@@ -7,16 +7,13 @@ import base64
 from datetime import datetime, date
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import google.generativeai as genai
+import anthropic
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-pro")
+claude = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 USER_PROFILE = {
     "name": "Кравцова",
@@ -29,16 +26,25 @@ USER_PROFILE = {
     "no_eat": ["варёные овощи", "лук"],
 }
 
-SYSTEM_PROMPT = """Ты личный нутрициолог для Кравцовой.
+SYSTEM_PROMPT = """Ты личный нутрициолог для Кравцовой Анастасии.
 Параметры: рост 162см, возраст 35 лет, стартовый вес 78.4кг, жир 39.6%.
 Цель: минус 10кг за 2 месяца. Норма: 1420 ккал, белок 110г, вода 2.5л.
 Не ест: варёные овощи, лук.
-Задачи: анализировать фото еды, читать весы Picooc, проверять составы продуктов, предлагать рецепты из холодильника, корректировать питание.
-Стиль: дружелюбно, кратко, по делу. Отвечай на русском."""
+Тренировки: зарядка, тазовое дно (Сабина Филина), резинка, пилатес (Александра Кибзий), устранение живота (Сергей Оларь).
+
+Задачи:
+1. Анализировать фото еды — калории, белок, что записать
+2. Читать фото с весов Picooc — вес, жир, мышцы, вода
+3. Анализировать состав продуктов — подходит/нет
+4. Рецепты из содержимого холодильника
+5. Корректировать питание — говорить если мало белка, много калорий
+6. Анализировать фото тела — описывать изменения
+
+Стиль: дружелюбно, кратко, по делу. Всегда на русском."""
 
 
 def init_db():
-    db_path = os.environ.get("DB_PATH", "/tmp/nutrition.db")
+    db_path = "/tmp/nutrition.db"
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS weight_log (
@@ -54,8 +60,7 @@ def init_db():
 
 
 def get_db():
-    db_path = os.environ.get("DB_PATH", "/tmp/nutrition.db")
-    return sqlite3.connect(db_path)
+    return sqlite3.connect("/tmp/nutrition.db")
 
 
 def get_today_stats():
@@ -113,6 +118,23 @@ def save_food(description, calories, protein):
         logger.error(f"save_food: {e}")
 
 
+def ask_claude(prompt, image_data=None, image_type="image/jpeg"):
+    content = []
+    if image_data:
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": image_type, "data": image_data}
+        })
+    content.append({"type": "text", "text": prompt})
+    response = claude.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": content}]
+    )
+    return response.content[0].text
+
+
 def main_keyboard():
     keyboard = [
         [KeyboardButton("📊 Статистика"), KeyboardButton("📸 Фото весов")],
@@ -145,7 +167,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cal_left = USER_PROFILE["calories_target"] - today["calories"]
         prot_left = USER_PROFILE["protein_target"] - today["protein"]
         msg = f"📊 {date.today().strftime('%d.%m')}\n\n"
-        msg += f"🔥 {today['calories']} / {USER_PROFILE['calories_target']} ккал (осталось {max(0,cal_left)})\n"
+        msg += f"🔥 {today['calories']} / {USER_PROFILE['calories_target']} ккал (осталось {max(0, cal_left)})\n"
         msg += f"💪 {today['protein']:.0f} / {USER_PROFILE['protein_target']}г белка"
         if prot_left > 0:
             msg += f" (ещё {prot_left:.0f}г)"
@@ -187,15 +209,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ctx += f" Последний вес: {last_w['weight']} кг."
 
     try:
-        response = model.generate_content(SYSTEM_PROMPT + ctx + f"\nСообщение: {text}")
-        reply = response.text
+        reply = ask_claude(ctx + f"\nСообщение: {text}")
 
         food_words = ["съела", "поела", "завтрак", "обед", "ужин", "перекус", "выпила", "ем", "пью", "скушала"]
         if any(w in text.lower() for w in food_words):
             try:
-                pr = model.generate_content(f"Из текста '{text}' определи калории и белок. ТОЛЬКО JSON: {{\"calories\": число, \"protein\": число, \"description\": \"название\"}}")
-                pt = pr.text.strip().replace("```json","").replace("```","").strip()
-                data = json.loads(pt)
+                parse_text = ask_claude(f"Из текста '{text}' определи калории и белок. Ответь ТОЛЬКО JSON без markdown: {{\"calories\": число, \"protein\": число, \"description\": \"название\"}}")
+                parse_text = parse_text.strip().replace("```json", "").replace("```", "").strip()
+                data = json.loads(parse_text)
                 if data.get("calories", 0) > 0:
                     save_food(data.get("description", text), data.get("calories", 0), data.get("protein", 0))
             except Exception:
@@ -223,35 +244,33 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ctx = f"Сегодня {date.today().strftime('%d.%m')}. Съедено: {today['calories']} ккал. Осталось: {USER_PROFILE['calories_target']-today['calories']} ккал."
-    scale_words = ["весы", "picooc", "пикок", "вес", "замер", "взвесилась", "весы"]
+    scale_words = ["весы", "picooc", "пикок", "вес", "замер", "взвесилась"]
     is_scale = any(w in caption.lower() for w in scale_words) or not caption
 
     if is_scale:
-        prompt = SYSTEM_PROMPT + "\n" + ctx + "\nНа фото весы Picooc или напольные весы. Прочитай показатели: вес кг, % жира, % мышц, % воды. Запиши и дай короткий комментарий по динамике. Если это не весы — скажи что именно на фото и проанализируй."
+        prompt = ctx + "\nНа фото весы Picooc или напольные весы. Прочитай все показатели: вес кг, % жира, % мышц, % воды, СООВ. Запиши и дай короткий комментарий. Если не весы — скажи что на фото."
     else:
-        prompt = SYSTEM_PROMPT + "\n" + ctx + f"\nФото с подписью: '{caption}'. Если еда — калории и белок, сколько осталось. Если состав — подходит/нет. Если тело — опиши изменения. Если холодильник — предложи рецепт."
+        prompt = ctx + f"\nФото с подписью: '{caption}'. Если еда — калории и белок, сколько осталось. Если состав продукта — подходит/нет. Если тело — опиши изменения. Если холодильник — предложи рецепт из того что видишь."
 
     try:
-        image_part = {"mime_type": "image/jpeg", "data": image_data}
-        response = model.generate_content([prompt, image_part])
-        reply = response.text
+        reply = ask_claude(prompt, image_data=image_data)
 
         if is_scale:
             try:
-                pr = model.generate_content(f"Из текста '{reply}' извлеки числа. ТОЛЬКО JSON: {{\"weight\": число, \"fat\": число, \"muscle\": число, \"water\": число}}")
-                pt = pr.text.strip().replace("```json","").replace("```","").strip()
-                data = json.loads(pt)
+                parse_text = ask_claude(f"Из текста '{reply}' извлеки числа. ТОЛЬКО JSON: {{\"weight\": число, \"fat\": число, \"muscle\": число, \"water\": число}}")
+                parse_text = parse_text.strip().replace("```json", "").replace("```", "").strip()
+                data = json.loads(parse_text)
                 if data.get("weight", 0) > 0:
-                    save_weight(data["weight"], data.get("fat",0), data.get("muscle",0), data.get("water",0))
+                    save_weight(data["weight"], data.get("fat", 0), data.get("muscle", 0), data.get("water", 0))
             except Exception:
                 pass
         else:
             try:
-                pr = model.generate_content(f"Из текста '{reply}' извлеки калории еды. ТОЛЬКО JSON: {{\"calories\": число, \"protein\": число, \"description\": \"название\"}}")
-                pt = pr.text.strip().replace("```json","").replace("```","").strip()
-                data = json.loads(pt)
+                parse_text = ask_claude(f"Из текста '{reply}' извлеки калории еды. ТОЛЬКО JSON: {{\"calories\": число, \"protein\": число, \"description\": \"название\"}}")
+                parse_text = parse_text.strip().replace("```json", "").replace("```", "").strip()
+                data = json.loads(parse_text)
                 if data.get("calories", 0) > 0:
-                    save_food(data.get("description","блюдо"), data["calories"], data.get("protein",0))
+                    save_food(data.get("description", "блюдо"), data["calories"], data.get("protein", 0))
             except Exception:
                 pass
 
