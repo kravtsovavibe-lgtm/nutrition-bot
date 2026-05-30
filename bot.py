@@ -286,7 +286,8 @@ async def post_init(application: Application):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(BOT_TOKEN).build()
+app.post_init = post_init
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
